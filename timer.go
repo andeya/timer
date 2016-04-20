@@ -2,158 +2,163 @@ package timer
 
 import (
 	"log"
-	"sort"
 	"sync"
 	"time"
 )
 
-// 每日定点定时器
-type DailyFixedTimer map[string][3]int //map["routine_1"][3]int{"24h","m","s"}
-
-func (self DailyFixedTimer) Wait(routine string) {
-	tdl := self.deadline(routine)
-	log.Printf("************************ ……<%s> 每日定时器等待至 %v ……************************\n", routine, tdl.Format("2006-01-02 15:04:05"))
-	time.Sleep(tdl.Sub(time.Now()))
-}
-
-func (self DailyFixedTimer) deadline(routine string) time.Time {
-	t := time.Now()
-	if t.Hour() > self[routine][0] {
-		t = t.Add(24 * time.Hour)
-	} else if t.Hour() == self[routine][0] && t.Minute() > self[routine][1] {
-		t = t.Add(24 * time.Hour)
-	} else if t.Hour() == self[routine][0] && t.Minute() == self[routine][1] && t.Second() >= self[routine][2] {
-		t = t.Add(24 * time.Hour)
-	}
-	year, month, day := t.Date()
-	return time.Date(year, month, day, self[routine][0], self[routine][1], self[routine][2], 0, time.Local)
-}
-
-// 动态倒计时器
-type CountdownTimer struct {
-	// 倒计时的时间(min)级别，由小到大排序
-	Level []float64
-	// 倒计时对象的非正式计时表
-	Routines map[string]*routineTime
-	//更新标记
-	Flag map[string]chan bool
+type Timer struct {
+	setting map[string]*Clock
+	closed  bool
 	sync.RWMutex
 }
 
-type routineTime struct {
-	Min  float64
-	Curr float64
+func newTimer() *Timer {
+	return &Timer{
+		setting: make(map[string]*Clock),
+	}
 }
 
-// 参数routines为 map[string]float64{倒计时对象UID: 最小等待的参考时间}
-func NewCountdownTimer(level []float64, routines map[string]float64) *CountdownTimer {
-	if len(level) == 0 {
-		level = []float64{60 * 24}
+// 休眠等待，并返回定时器是否可以继续使用
+func (self *Timer) sleep(id string) bool {
+	self.RLock()
+	if self.closed {
+		self.RUnlock()
+		return false
 	}
-	sort.Float64s(level)
-	ct := &CountdownTimer{
-		Level:    level,
-		Routines: make(map[string]*routineTime),
-		Flag:     make(map[string]chan bool),
+
+	c, ok := self.setting[id]
+	self.RUnlock()
+	if !ok {
+		return false
 	}
-	for routine, minTime := range routines {
-		ct.Routines[routine] = &routineTime{
-			Curr: ct.Level[0],
-			Min:  minTime,
+
+	c.sleep()
+
+	self.RLock()
+	if self.closed {
+		return false
+	}
+	_, ok = self.setting[id]
+	self.RUnlock()
+
+	return ok
+}
+
+// @bell==nil时为倒计时器，此时@tol为睡眠时长
+// @bell!=nil时为闹铃，此时@tol用于指定醒来时刻（从now起遇到的第tol个bell）
+func (self *Timer) set(id string, tol time.Duration, bell *Bell) bool {
+	self.Lock()
+	defer self.Unlock()
+	if self.closed {
+		log.Printf("************************ ……设置定时器 <%s> 失败，定时系统已关闭 ……************************", id)
+		return false
+	}
+	c, ok := newClock(id, tol, bell)
+	if !ok {
+		log.Printf("************************ ……设置定时器 <%s> 失败，参数不正确 ……************************", id)
+		return ok
+	}
+	self.setting[id] = c
+	log.Printf("************************ ……设置定时器 <%s> 成功 ……************************", id)
+	return ok
+}
+
+func (self *Timer) drop() {
+	self.Lock()
+	defer self.Unlock()
+	self.closed = true
+	for _, c := range self.setting {
+		c.wake()
+	}
+	self.setting = make(map[string]*Clock)
+}
+
+type (
+	Clock struct {
+		id string
+		// 模式（闹铃or倒计时）
+		typ int
+		// 倒计时的睡眠时长
+		// 或指定闹铃醒来时刻为从now起遇到的第tol个bell
+		tol time.Duration
+		// 闹铃醒来时刻
+		bell  *Bell
+		timer *time.Timer
+	}
+	Bell struct {
+		Hour int
+		Min  int
+		Sec  int
+	}
+)
+
+const (
+	// 闹钟
+	A = iota
+	// 倒计时
+	T
+)
+
+// @bell==nil时为倒计时器，此时@tol为睡眠时长
+// @bell!=nil时为闹铃，此时@tol用于指定醒来时刻（从now起遇到的第tol个bell）
+func newClock(id string, tol time.Duration, bell *Bell) (*Clock, bool) {
+	if tol <= 0 {
+		return nil, false
+	}
+	if bell == nil {
+		return &Clock{
+			id:    id,
+			typ:   T,
+			tol:   tol,
+			timer: newT(),
+		}, true
+	}
+	if !(bell.Hour >= 0 && bell.Hour < 24 && bell.Min >= 0 && bell.Min < 60 && bell.Sec >= 0 && bell.Sec < 60) {
+		return nil, false
+	}
+	return &Clock{
+		id:    id,
+		typ:   A,
+		tol:   tol,
+		bell:  bell,
+		timer: newT(),
+	}, true
+}
+
+func (self *Clock) sleep() {
+	d := self.duration()
+	self.timer.Reset(d)
+	t0 := time.Now()
+	log.Printf("************************ ……定时器 <%s> 睡眠 %v ，计划 %v 醒来 ……************************", self.id, d, t0.Add(d).Format("2006-01-02 15:04:05"))
+	<-self.timer.C
+	t1 := time.Now()
+	log.Printf("************************ ……定时器 <%s> 在 %v 醒来，实际睡眠 %v ……************************", self.id, t1.Format("2006-01-02 15:04:05"), t1.Sub(t0))
+}
+
+func (self *Clock) wake() {
+	self.timer.Reset(0)
+}
+
+func (self *Clock) duration() time.Duration {
+	switch self.typ {
+	case A:
+		t := time.Now()
+		year, month, day := t.Date()
+		bell := time.Date(year, month, day, self.bell.Hour, self.bell.Min, self.bell.Sec, 0, time.Local)
+		if bell.Before(t) {
+			bell = bell.Add(time.Hour * 24 * self.tol)
+		} else {
+			bell = bell.Add(time.Hour * 24 * (self.tol - 1))
 		}
+		return bell.Sub(t)
+	case T:
+		return self.tol
 	}
-	return ct
+	return 0
 }
 
-// 需在执行Update()的协程执行之后调用
-func (self *CountdownTimer) Wait(routine string) {
-	self.RWMutex.RLock()
-	defer self.RWMutex.RUnlock()
-	if _, ok := self.Routines[routine]; !ok {
-		return
-	}
-	self.Flag[routine] = make(chan bool)
-	defer func() {
-		if err := recover(); err != nil {
-			log.Printf("动态倒计时器: %v", err)
-		}
-		select {
-		case <-self.Flag[routine]:
-			n := self.Routines[routine].Curr / 1.2
-			if n > self.Routines[routine].Min {
-				self.Routines[routine].Curr = n
-			} else {
-				// 等待时间不能小于设定时间
-				self.Routines[routine].Curr = self.Routines[routine].Min
-			}
-
-			if self.Routines[routine].Curr < self.Level[0] {
-				// 等待时间不能小于最小水平
-				self.Routines[routine].Curr = self.Level[0]
-			}
-		default:
-			self.Routines[routine].Curr = self.Routines[routine].Curr * 1.2
-			if self.Routines[routine].Curr > self.Level[len(self.Level)-1] {
-				// 等待时间不能大于最大水平
-				self.Routines[routine].Curr = self.Level[len(self.Level)-1]
-			}
-		}
-	}()
-	for k, v := range self.Level {
-		if v < self.Routines[routine].Curr {
-			continue
-		}
-
-		if k != 0 && v != self.Routines[routine].Curr {
-			k--
-		}
-		log.Printf("************************ ……<%s> 倒计时等待 %v 分钟……************************", routine, self.Level[k])
-		time.Sleep(time.Duration(self.Level[k]) * time.Minute)
-		break
-	}
-	close(self.Flag[routine])
-}
-
-// 需在Wait()方法执行之前，在新的协程调用
-func (self *CountdownTimer) Update(routine string) {
-	self.RWMutex.RLock()
-	defer func() {
-		recover()
-		self.RWMutex.RUnlock()
-	}()
-
-	if _, ok := self.Routines[routine]; !ok {
-		return
-	}
-
-	select {
-	case self.Flag[routine] <- true:
-	default:
-		return
-	}
-}
-
-func (self *CountdownTimer) SetRoutine(routine string, minTime float64) *CountdownTimer {
-	self.RWMutex.Lock()
-	defer self.RWMutex.Unlock()
-	self.Routines[routine] = &routineTime{
-		Curr: self.Level[0],
-		Min:  minTime,
-	}
-	return self
-}
-
-func (self *CountdownTimer) RemoveRoutine(routine string) *CountdownTimer {
-	self.RWMutex.Lock()
-	defer self.RWMutex.Unlock()
-	delete(self.Routines, routine)
-	delete(self.Flag, routine)
-	return self
-}
-
-func (self *CountdownTimer) SetLevel(level []float64) *CountdownTimer {
-	self.RWMutex.Lock()
-	defer self.RWMutex.Unlock()
-	self.Level = level
-	return self
+func newT() *time.Timer {
+	t := time.NewTimer(0)
+	<-t.C
+	return t
 }
