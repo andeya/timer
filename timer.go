@@ -12,7 +12,7 @@ type Timer struct {
 	sync.RWMutex
 }
 
-func newTimer() *Timer {
+func NewTimer() *Timer {
 	return &Timer{
 		setting: make(map[string]*Clock),
 	}
