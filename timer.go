@@ -19,7 +19,7 @@ func NewTimer() *Timer {
 }
 
 // 休眠等待，并返回定时器是否可以继续使用
-func (self *Timer) sleep(id string) bool {
+func (self *Timer) Sleep(id string) bool {
 	self.RLock()
 	if self.closed {
 		self.RUnlock()
@@ -46,7 +46,7 @@ func (self *Timer) sleep(id string) bool {
 
 // @bell==nil时为倒计时器，此时@tol为睡眠时长
 // @bell!=nil时为闹铃，此时@tol用于指定醒来时刻（从now起遇到的第tol个bell）
-func (self *Timer) set(id string, tol time.Duration, bell *Bell) bool {
+func (self *Timer) Set(id string, tol time.Duration, bell *Bell) bool {
 	self.Lock()
 	defer self.Unlock()
 	if self.closed {
@@ -63,7 +63,7 @@ func (self *Timer) set(id string, tol time.Duration, bell *Bell) bool {
 	return ok
 }
 
-func (self *Timer) drop() {
+func (self *Timer) Drop() {
 	self.Lock()
 	defer self.Unlock()
 	self.closed = true
